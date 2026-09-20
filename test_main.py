@@ -33,6 +33,15 @@ client = TestClient(app)
         ("multiplicacion", 3, 0, 0),
         ("division", 10, 4, 2.5),
         ("division", -9, 3, -3),
+        ("potencia", 2, 10, 1024),
+        ("potencia", 5, 0, 1),
+        ("potencia", 9, 0.5, 3),
+        ("potencia", -2, 3, -8),
+        ("raiz", 64, 0, 8),          # b viaja pero se ignora: raiz es unaria
+        ("raiz", 2, 999, 2 ** 0.5),  # idem, con un b bien distinto para probar que no influye
+        ("porcentaje", 20, 200, 40),  # el 20% de 200
+        ("porcentaje", 50, 10, 5),    # el 50% de 10
+        ("porcentaje", 0, 500, 0),
     ],
 )
 def test_calcula_correctamente(operacion, a, b, esperado):
@@ -63,7 +72,7 @@ def test_division_por_cero_devuelve_400_y_no_revienta():
 
 def test_operacion_desconocida_devuelve_422():
     # 422 lo genera Pydantic solo, porque el campo esta tipado como Literal.
-    respuesta = client.post("/api/calcular", json={"a": 1, "b": 2, "operacion": "potencia"})
+    respuesta = client.post("/api/calcular", json={"a": 1, "b": 2, "operacion": "logaritmo"})
 
     assert respuesta.status_code == 422
 
@@ -142,6 +151,123 @@ def test_falta_un_campo_devuelve_422():
     respuesta = client.post("/api/calcular", json={"a": 1, "operacion": "suma"})
 
     assert respuesta.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Potencia — casos borde propios de esta operacion
+# ---------------------------------------------------------------------------
+# A diferencia de las otras tres, potencia puede fallar de tres formas
+# distintas y ninguna es un bug del servidor: base negativa con exponente
+# fraccionario (resultado complejo), 0 elevado a negativo (equivale a
+# dividir por cero) y un resultado demasiado grande para un float.
+
+def test_potencia_base_negativa_con_exponente_fraccionario_da_400():
+    respuesta = client.post(
+        "/api/calcular", json={"a": -8, "b": 0.5, "operacion": "potencia"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "real" in respuesta.json()["detail"].lower()
+
+
+def test_potencia_cero_elevado_a_negativo_da_400_y_no_500():
+    respuesta = client.post(
+        "/api/calcular", json={"a": 0, "b": -2, "operacion": "potencia"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "cero" in respuesta.json()["detail"].lower()
+
+
+def test_potencia_resultado_fuera_de_rango_da_400_y_no_500():
+    respuesta = client.post(
+        "/api/calcular", json={"a": 10, "b": 400, "operacion": "potencia"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "rango" in respuesta.json()["detail"].lower()
+
+
+def test_potencia_base_negativa_con_exponente_entero_funciona():
+    # Este es el caso que SI tiene una respuesta real y no debe rechazarse:
+    # (-2) ** 3 = -8, sin ambiguedad ni numero complejo de por medio.
+    respuesta = client.post(
+        "/api/calcular", json={"a": -2, "b": 3, "operacion": "potencia"}
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["resultado"] == -8
+
+
+# ---------------------------------------------------------------------------
+# Raiz — unica forma de fallar: numero negativo
+# ---------------------------------------------------------------------------
+# A diferencia de potencia, raiz solo tiene UN caso borde: no existe raiz
+# cuadrada real de un negativo. No hay overflow posible (la raiz de un numero
+# representable siempre entra en un float) y b ni se mira.
+
+def test_raiz_de_negativo_da_400_y_no_500():
+    respuesta = client.post(
+        "/api/calcular", json={"a": -9, "b": 0, "operacion": "raiz"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "negativo" in respuesta.json()["detail"].lower()
+
+
+def test_raiz_de_cero_da_cero_y_no_error():
+    # Caso limite que NO es un error: la raiz de 0 es 0, sin ambiguedad.
+    respuesta = client.post(
+        "/api/calcular", json={"a": 0, "b": 0, "operacion": "raiz"}
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["resultado"] == 0
+
+
+def test_raiz_ignora_b_en_la_expresion():
+    # La expresion mostrada no debe mencionar b (es unaria): "√64.0 = 8.0",
+    # no "64.0 √ 999.0 = 8.0".
+    respuesta = client.post(
+        "/api/calcular", json={"a": 64, "b": 999, "operacion": "raiz"}
+    )
+
+    cuerpo = respuesta.json()
+    assert cuerpo["resultado"] == 8
+    assert "999" not in cuerpo["expresion"]
+    assert cuerpo["expresion"] == "√64.0 = 8.0"
+
+
+# ---------------------------------------------------------------------------
+# Porcentaje — no tiene casos borde propios
+# ---------------------------------------------------------------------------
+# (a / 100) * b nunca dispara un ValueError ni un OverflowError distinto de
+# los que ya cubre la regla general de "resultado fuera de rango" (seccion de
+# arriba). Lo unico que hace falta probar es el SIGNIFICADO (el a% de b, no
+# "a por ciento b") y como se ve la expresion.
+
+def test_porcentaje_significa_el_a_por_ciento_de_b():
+    respuesta = client.post(
+        "/api/calcular", json={"a": 25, "b": 80, "operacion": "porcentaje"}
+    )
+
+    # El 25% de 80 es 20.
+    #
+    # Nota al pasar: (a/100)*b es lo mismo que (b/100)*a -- la multiplicacion
+    # es conmutativa -- asi que "el 25% de 80" y "el 80% de 25" dan el MISMO
+    # numero (20). Eso no es un bug: es una curiosidad matematica real (por
+    # eso a veces conviene calcular el porcentaje "facil" al reves: el 4% de
+    # 50 es incomodo, pero el 50% de 4 es la mitad de 4, o sea 2, al toque).
+    assert respuesta.json()["resultado"] == 20
+
+
+def test_porcentaje_muestra_la_expresion_en_formato_legible():
+    respuesta = client.post(
+        "/api/calcular", json={"a": 10, "b": 50, "operacion": "porcentaje"}
+    )
+
+    cuerpo = respuesta.json()
+    assert cuerpo["expresion"] == "10.0% de 50.0 = 5.0"
 
 
 # ---------------------------------------------------------------------------

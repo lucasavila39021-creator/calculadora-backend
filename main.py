@@ -57,7 +57,7 @@ async def ciclo_de_vida(app: FastAPI):
 
 app = FastAPI(
     title="Calculadora API",
-    description="API didactica de 4 operaciones. Historial opcional en Postgres.",
+    description="API didactica de 7 operaciones. Historial opcional en Postgres.",
     version="3.0.0",
     lifespan=ciclo_de_vida,
 )
@@ -199,7 +199,9 @@ app.add_middleware(
 # rechaza solo todo lo que no encaje, con un 422 y un mensaje explicando que
 # campo esta mal.
 
-Operacion = Literal["suma", "resta", "multiplicacion", "division"]
+Operacion = Literal[
+    "suma", "resta", "multiplicacion", "division", "potencia", "raiz", "porcentaje"
+]
 
 # Tabla unica: cada operacion sabe su simbolo y como se calcula.
 # Un solo lugar para agregar una operacion nueva -> un solo lugar donde
@@ -209,11 +211,34 @@ Operacion = Literal["suma", "resta", "multiplicacion", "division"]
 # es la funcion built-in que pregunta si algo se puede llamar. Usarla como
 # anotacion no rompe en runtime (Python no chequea tipos), pero mypy la rechaza
 # y quien lea el codigo se confunde.
+#
+# potencia usa math.pow y no el operador **: la diferencia importa aca. Python
+# puro (a ** b) con base negativa y exponente fraccionario devuelve un numero
+# COMPLEJO en vez de fallar, y un complejo no entra en un float ni en JSON.
+# math.pow, en cambio, hace lo que un endpoint HTTP necesita: rechaza ese caso
+# con una excepcion clara (ValueError) que se atrapa mas abajo y se convierte
+# en un 400, en vez de dejar pasar un tipo de dato que rompe todo rio abajo.
+#
+# raiz es UNARIA (solo usa `a`; `b` viaja igual porque el contrato pide los
+# dos campos siempre, pero se ignora) — es la raiz cuadrada, no una raiz
+# n-esima generica. Se eligio asi, y no "raiz b-esima de a", para no reabrir
+# la misma familia de casos borde que potencia (base negativa + indice par,
+# indice cero, etc.) en una funcionalidad que se penso simple. math.sqrt
+# rechaza numeros negativos con ValueError, igual que math.pow mas arriba.
+#
+# porcentaje SI usa los dos campos, pero con un significado distinto al resto:
+# no es "a por ciento b", es "el a% de b" -> (a / 100) * b. Por eso el simbolo
+# de esta fila no se usa en la formula generica de mas abajo (mira el bloque
+# de armado de `expresion`): "10.0 % 50.0 = 5.0" no se entiende, "10.0% de
+# 50.0 = 5.0" si.
 OPERACIONES: dict[str, tuple[str, Callable[[float, float], float]]] = {
     "suma": ("+", lambda a, b: a + b),
     "resta": ("-", lambda a, b: a - b),
     "multiplicacion": ("*", lambda a, b: a * b),
     "division": ("/", lambda a, b: a / b),
+    "potencia": ("^", math.pow),
+    "raiz": ("√", lambda a, b: math.sqrt(a)),
+    "porcentaje": ("%", lambda a, b: (a / 100) * b),
 }
 
 
@@ -316,7 +341,49 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
         # No es un 500: el servidor esta perfecto, el pedido es el invalido.
         raise HTTPException(status_code=400, detail="No se puede dividir por cero.")
 
-    resultado = calcular_fn(datos.a, datos.b)
+    # Regla de negocio, exclusiva de potencia: base negativa y exponente
+    # fraccionario. (-8) ** (1/3) es -2 para una persona, pero matematicamente
+    # tiene infinitas raices y la mayoria son numeros complejos — math.pow no
+    # sabe elegir "la real" y directamente rechaza el calculo. Es la misma
+    # logica que la division por cero: un dato de ENTRADA que no se puede
+    # procesar es un 400, no un 500.
+    if datos.operacion == "potencia" and datos.a < 0 and not datos.b.is_integer():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No se puede elevar un numero negativo a un exponente no "
+                "entero: el resultado no es un numero real."
+            ),
+        )
+
+    # calcular_fn puede fallar ademas por otros dos motivos, los dos propios
+    # de potencia: 0 elevado a un exponente negativo (equivale a dividir por
+    # cero: math.pow lanza ValueError) y un resultado tan enorme que ni
+    # siquiera Python puede representarlo como float (math.pow lanza
+    # OverflowError ANTES de devolver "inf", a diferencia de *, que sí llega a
+    # devolver "inf" y se atrapa mas abajo). Ambos son datos de entrada
+    # invalidos, no un bug del servidor: 400.
+    try:
+        resultado = calcular_fn(datos.a, datos.b)
+    except ValueError:
+        # ValueError puede venir de DOS operaciones distintas, y cada una
+        # necesita su propio mensaje: la de potencia (0 elevado a negativo) y
+        # la de raiz (numero negativo, math.sqrt no sabe de complejos). Sin
+        # este if, quien probara raiz(-9) leeria un mensaje sobre "elevar a
+        # exponente negativo" que no tiene nada que ver con lo que pidio.
+        if datos.operacion == "raiz":
+            detail = "No existe raiz cuadrada real de un numero negativo."
+        else:
+            detail = "No se puede elevar 0 a un exponente negativo (equivale a dividir por cero)."
+        raise HTTPException(status_code=400, detail=detail)
+    except OverflowError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El resultado quedo fuera del rango que puede representar la "
+                "computadora (mas o menos 1.8e308). Probá con numeros mas chicos."
+            ),
+        )
 
     # Regla de negocio 2: el resultado tiene que entrar en un float.
     # Los dos operandos pueden ser finitos y perfectamente validos, y aun asi
@@ -337,7 +404,16 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
             ),
         )
 
-    expresion = f"{datos.a} {simbolo} {datos.b} = {resultado}"
+    # Dos operaciones necesitan una expresion distinta a la generica
+    # "a simbolo b = resultado": raiz es UNARIA (mostrar el b que se ignoro
+    # seria confuso: "64.0 √ 999.0" sugiere que 999 participo, y no)
+    # y porcentaje se lee mejor como "a% de b" que como "a % b".
+    if datos.operacion == "raiz":
+        expresion = f"{simbolo}{datos.a} = {resultado}"
+    elif datos.operacion == "porcentaje":
+        expresion = f"{datos.a}{simbolo} de {datos.b} = {resultado}"
+    else:
+        expresion = f"{datos.a} {simbolo} {datos.b} = {resultado}"
 
     # El guardado va DESPUES de que la cuenta salio bien, y no puede fallar
     # hacia afuera: db.guardar() se traga cualquier error y lo manda al log.
