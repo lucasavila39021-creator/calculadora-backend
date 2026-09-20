@@ -57,8 +57,8 @@ async def ciclo_de_vida(app: FastAPI):
 
 app = FastAPI(
     title="Calculadora API",
-    description="API didactica de 7 operaciones. Historial opcional en Postgres.",
-    version="3.0.0",
+    description="API didactica de 8 operaciones. Historial opcional en Postgres.",
+    version="3.1.0",
     lifespan=ciclo_de_vida,
 )
 
@@ -200,7 +200,8 @@ app.add_middleware(
 # campo esta mal.
 
 Operacion = Literal[
-    "suma", "resta", "multiplicacion", "division", "potencia", "raiz", "porcentaje"
+    "suma", "resta", "multiplicacion", "division", "potencia", "raiz", "porcentaje",
+    "factorial",
 ]
 
 # Tabla unica: cada operacion sabe su simbolo y como se calcula.
@@ -231,6 +232,16 @@ Operacion = Literal[
 # de esta fila no se usa en la formula generica de mas abajo (mira el bloque
 # de armado de `expresion`): "10.0 % 50.0 = 5.0" no se entiende, "10.0% de
 # 50.0 = 5.0" si.
+#
+# factorial, como raiz, es UNARIA (solo usa `a`; `b` viaja igual porque el
+# contrato lo pide siempre, pero se ignora). Solo esta definida para enteros
+# no negativos -- eso se valida ANTES de llegar aca (ver la regla de negocio
+# en calcular()), asi que para cuando esta lambda corre, `a` ya es seguro
+# convertir con int(). math.factorial devuelve un int de Python (precision
+# arbitraria); lo pasamos por float() para que el contrato de esta tabla
+# (Callable[[float, float], float]) se cumpla siempre. Si el numero es
+# gigantesco, float() no puede representarlo y tira OverflowError, que ya se
+# atrapa mas abajo igual que el overflow de potencia.
 OPERACIONES: dict[str, tuple[str, Callable[[float, float], float]]] = {
     "suma": ("+", lambda a, b: a + b),
     "resta": ("-", lambda a, b: a - b),
@@ -239,6 +250,7 @@ OPERACIONES: dict[str, tuple[str, Callable[[float, float], float]]] = {
     "potencia": ("^", math.pow),
     "raiz": ("√", lambda a, b: math.sqrt(a)),
     "porcentaje": ("%", lambda a, b: (a / 100) * b),
+    "factorial": ("!", lambda a, b: float(math.factorial(int(a)))),
 }
 
 
@@ -356,6 +368,18 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
             ),
         )
 
+    # Regla de negocio, exclusiva de factorial: solo esta definido para
+    # enteros no negativos. -3! y 2.5! no significan nada matematicamente
+    # (bueno, existe la funcion Gamma para el segundo caso, pero eso ya es
+    # otra operacion, no "el factorial"). Se valida ACA y no en Pydantic
+    # porque, igual que division-por-cero y potencia mas arriba, depende del
+    # VALOR de un campo, no solo de su tipo.
+    if datos.operacion == "factorial" and (datos.a < 0 or not datos.a.is_integer()):
+        raise HTTPException(
+            status_code=400,
+            detail="El factorial solo esta definido para numeros enteros no negativos.",
+        )
+
     # calcular_fn puede fallar ademas por otros dos motivos, los dos propios
     # de potencia: 0 elevado a un exponente negativo (equivale a dividir por
     # cero: math.pow lanza ValueError) y un resultado tan enorme que ni
@@ -404,12 +428,14 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
             ),
         )
 
-    # Dos operaciones necesitan una expresion distinta a la generica
-    # "a simbolo b = resultado": raiz es UNARIA (mostrar el b que se ignoro
-    # seria confuso: "64.0 √ 999.0" sugiere que 999 participo, y no)
-    # y porcentaje se lee mejor como "a% de b" que como "a % b".
+    # Tres operaciones necesitan una expresion distinta a la generica
+    # "a simbolo b = resultado": raiz y factorial son UNARIAS (mostrar el b
+    # que se ignoro seria confuso: "64.0 √ 999.0" sugiere que 999 participo,
+    # y no) y porcentaje se lee mejor como "a% de b" que como "a % b".
     if datos.operacion == "raiz":
         expresion = f"{simbolo}{datos.a} = {resultado}"
+    elif datos.operacion == "factorial":
+        expresion = f"{datos.a}{simbolo} = {resultado}"
     elif datos.operacion == "porcentaje":
         expresion = f"{datos.a}{simbolo} de {datos.b} = {resultado}"
     else:

@@ -42,6 +42,9 @@ client = TestClient(app)
         ("porcentaje", 20, 200, 40),  # el 20% de 200
         ("porcentaje", 50, 10, 5),    # el 50% de 10
         ("porcentaje", 0, 500, 0),
+        ("factorial", 5, 0, 120),   # b viaja pero se ignora: factorial es unaria
+        ("factorial", 0, 999, 1),   # 0! = 1, y b bien distinto para probar que no influye
+        ("factorial", 1, 0, 1),
     ],
 )
 def test_calcula_correctamente(operacion, a, b, esperado):
@@ -236,6 +239,65 @@ def test_raiz_ignora_b_en_la_expresion():
     assert cuerpo["resultado"] == 8
     assert "999" not in cuerpo["expresion"]
     assert cuerpo["expresion"] == "√64.0 = 8.0"
+
+
+# ---------------------------------------------------------------------------
+# Factorial — solo esta definido para enteros no negativos
+# ---------------------------------------------------------------------------
+# Tres formas de fallar (mas que raiz, menos que potencia): negativo, no
+# entero, y un resultado tan grande que no entra en un float.
+
+def test_factorial_de_negativo_da_400_y_no_500():
+    respuesta = client.post(
+        "/api/calcular", json={"a": -3, "b": 0, "operacion": "factorial"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "no negativo" in respuesta.json()["detail"].lower()
+
+
+def test_factorial_de_no_entero_da_400():
+    respuesta = client.post(
+        "/api/calcular", json={"a": 4.5, "b": 0, "operacion": "factorial"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "entero" in respuesta.json()["detail"].lower()
+
+
+def test_factorial_de_cero_da_uno_y_no_error():
+    # Caso limite que NO es un error: 0! = 1, por definicion.
+    respuesta = client.post(
+        "/api/calcular", json={"a": 0, "b": 0, "operacion": "factorial"}
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["resultado"] == 1
+
+
+def test_factorial_de_numero_gigante_da_400_por_overflow_y_no_500():
+    # 200! no entra en un float (el limite esta un poco antes de 171!).
+    # Tiene que dar el mismo 400 controlado que un overflow de potencia,
+    # nunca un 500.
+    respuesta = client.post(
+        "/api/calcular", json={"a": 200, "b": 0, "operacion": "factorial"}
+    )
+
+    assert respuesta.status_code == 400
+    assert "rango" in respuesta.json()["detail"].lower()
+
+
+def test_factorial_ignora_b_en_la_expresion():
+    # La expresion mostrada no debe mencionar b (es unaria): "5.0! = 120.0",
+    # no "5.0 ! 999.0 = 120.0".
+    respuesta = client.post(
+        "/api/calcular", json={"a": 5, "b": 999, "operacion": "factorial"}
+    )
+
+    cuerpo = respuesta.json()
+    assert cuerpo["resultado"] == 120
+    assert "999" not in cuerpo["expresion"]
+    assert cuerpo["expresion"] == "5.0! = 120.0"
 
 
 # ---------------------------------------------------------------------------
